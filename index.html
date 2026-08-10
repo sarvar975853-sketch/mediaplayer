@@ -14,10 +14,11 @@
 </style>
 <script>
   const CONFIG = {
-    OWNER: "sarvar975853-sketch",   // <-- change this
-    REPO: "mediaplayer",          // <-- change this
+    OWNER: "your-github-username",   // <-- change this
+    REPO: "your-repo-name",          // <-- change this
     BRANCH: "main",                  // <-- change if your default branch differs
     ROOT: "media",                   // <-- folder in the repo where files live
+    LINKS_PATH: "links.json",        // <-- repo-root JSON file listing external files (e.g. Internet Archive)
     SITE_TITLE: "MEDIA VAULT",
   };
 </script>
@@ -247,6 +248,10 @@
     color:var(--muted);
     flex:none;
   }
+  .file-row .tag.external{
+    border-color:var(--accent-dim);
+    color:var(--accent);
+  }
   .file-row .dl{
     color:var(--muted);
     flex:none;
@@ -376,6 +381,80 @@
     return items;
   }
 
+  // apiGet, but a missing/empty real folder just means "no real files here" —
+  // useful for folders that exist only virtually via links.json
+  async function apiGetSafe(path){
+    try{
+      return await apiGet(path);
+    }catch(e){
+      if (e.message === "NOT_FOUND") return [];
+      throw e;
+    }
+  }
+
+  // ---------- external links (links.json) ----------
+  let linksMap = {};      // path -> [{name, url}, ...]
+  let linksLoaded = false;
+
+  async function loadLinksMap(){
+    if (linksLoaded) return linksMap;
+    linksLoaded = true;
+    try{
+      const url = `https://api.github.com/repos/${CONFIG.OWNER}/${CONFIG.REPO}/contents/${encodeURI(CONFIG.LINKS_PATH)}?ref=${CONFIG.BRANCH}`;
+      const res = await fetch(url, { headers: { "Accept": "application/vnd.github+json" } });
+      if (!res.ok) return linksMap; // no links.json yet — that's fine, just no external files
+      const data = await res.json();
+      if (data && data.content){
+        const json = decodeURIComponent(escape(atob(data.content.replace(/\n/g, ""))));
+        const parsed = JSON.parse(json);
+        if (parsed && typeof parsed === "object") linksMap = parsed;
+      }
+    }catch(e){
+      console.warn("Couldn't load links.json — continuing without external links.", e);
+    }
+    return linksMap;
+  }
+
+  // immediate virtual subfolder names of `path`, derived purely from links.json keys
+  function virtualChildFolders(path){
+    const seen = new Set();
+    const prefix = path + "/";
+    Object.keys(linksMap).forEach(key => {
+      if (key === path) return;
+      if (!key.startsWith(prefix)) return;
+      const rest = key.slice(prefix.length);
+      const segment = rest.split("/")[0];
+      if (segment) seen.add(segment);
+    });
+    return Array.from(seen).map(name => ({
+      name,
+      path: path + "/" + name,
+      type: "dir",
+      virtual: true,
+    }));
+  }
+
+  // merges real GitHub items with virtual folders + external files for a given path
+  function mergeWithExternals(path, realItems){
+    const realDirNames = new Set(realItems.filter(i => i.type === "dir").map(i => i.name));
+    const virtualDirs = virtualChildFolders(path).filter(v => !realDirNames.has(v.name));
+
+    const externalFiles = (linksMap[path] || []).map(entry => ({
+      name: entry.name,
+      type: "file",
+      external: true,
+      download_url: entry.url,
+      size: null,
+    }));
+
+    const combined = [...realItems, ...virtualDirs, ...externalFiles];
+    combined.sort((a,b) => {
+      if ((a.type === "dir") !== (b.type === "dir")) return a.type === "dir" ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    return combined;
+  }
+
   // ---------- folder tree (sidebar) ----------
   const treeRoot = document.getElementById("tree");
 
@@ -405,9 +484,13 @@
       if (isOpen && !loaded){
         loaded = true;
         try{
-          const items = await apiGet(path);
-          const folders = items.filter(i => i.type === "dir");
-          for (const f of folders){
+          const realItems = await apiGetSafe(path);
+          const realFolders = realItems.filter(i => i.type === "dir");
+          const virtualFolders = virtualChildFolders(path);
+          const realNames = new Set(realFolders.map(f => f.name));
+          const allFolders = [...realFolders, ...virtualFolders.filter(v => !realNames.has(v.name))]
+            .sort((a,b) => a.name.localeCompare(b.name));
+          for (const f of allFolders){
             await buildTreeItem(f.path, depth+1, childWrap);
           }
         }catch(e){
@@ -466,7 +549,10 @@
     renderBreadcrumb(path);
     fileListEl.innerHTML = `<div class="status">loading…</div>`;
     try{
-      const items = await apiGet(path);
+      const realItems = await apiGetSafe(path);
+      await loadLinksMap();
+      const items = mergeWithExternals(path, realItems);
+
       fileListEl.innerHTML = "";
       if (items.length === 0){
         fileListEl.innerHTML = `<div class="status">this folder is empty</div>`;
@@ -476,13 +562,15 @@
         const row = document.createElement("div");
         row.className = "file-row" + (item.type === "dir" ? " folder" : "");
         const k = item.type === "file" ? kindOf(item.name) : null;
-        const tag = k === "video-risky" ? `<span class="tag">check codec</span>` : "";
+        const riskyTag = k === "video-risky" ? `<span class="tag">check codec</span>` : "";
+        const externalTag = item.external ? `<span class="tag external">external</span>` : "";
         row.innerHTML = `
           ${iconFor(item.type, item.name)}
           <span class="name">${item.name}</span>
-          ${tag}
-          <span class="meta">${item.type === "file" ? humanSize(item.size) : ""}</span>
-          ${item.type === "file" ? `<a class="dl" href="${item.download_url}" download title="download" onclick="event.stopPropagation()"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3v12m0 0-4-4m4 4 4-4M4 20h16" stroke="currentColor" stroke-width="1.6"/></svg></a>` : ""}
+          ${externalTag}
+          ${riskyTag}
+          <span class="meta">${item.type === "file" && item.size != null ? humanSize(item.size) : ""}</span>
+          ${item.type === "file" ? `<a class="dl" href="${item.download_url}" ${item.external ? 'target="_blank" rel="noopener"' : "download"} title="${item.external ? "open" : "download"}" onclick="event.stopPropagation()"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3v12m0 0-4-4m4 4 4-4M4 20h16" stroke="currentColor" stroke-width="1.6"/></svg></a>` : ""}
         `;
         row.addEventListener("click", () => {
           if (item.type === "dir"){
@@ -553,6 +641,7 @@
 
   // ---------- boot ----------
   (async function init(){
+    await loadLinksMap();
     await buildTreeItem(CONFIG.ROOT, 0, treeRoot);
     const rootRow = treeRoot.querySelector(`.tree-item[data-path="${CSS.escape(CONFIG.ROOT)}"]`);
     if (rootRow) rootRow.click();
