@@ -19,6 +19,9 @@
     BRANCH: "main",                  // <-- change if your default branch differs
     ROOT: "media",                   // <-- folder in the repo where files live
     LINKS_PATH: "links.json",        // <-- repo-root JSON file listing external files (e.g. Internet Archive)
+    ARCHIVE_ITEMS: {                 // <-- folder path -> Internet Archive identifier(s), auto-scanned for playable files
+      "media": ["MediaPlayerFiles"],
+    },
     SITE_TITLE: "MEDIA VAULT",
   };
 </script>
@@ -415,11 +418,61 @@
     return linksMap;
   }
 
-  // immediate virtual subfolder names of `path`, derived purely from links.json keys
+  // ---------- Internet Archive item scanning ----------
+  const archiveCache = new Map(); // identifier -> [{name, url, size}, ...]
+
+  async function fetchArchiveItem(identifier){
+    if (archiveCache.has(identifier)) return archiveCache.get(identifier);
+    try{
+      const res = await fetch(`https://archive.org/metadata/${encodeURIComponent(identifier)}`);
+      if (!res.ok){
+        console.warn("Couldn't reach Internet Archive item:", identifier, res.status);
+        archiveCache.set(identifier, []);
+        return [];
+      }
+      const data = await res.json();
+      const files = Array.isArray(data.files) ? data.files : [];
+      const playable = files
+        .filter(f => f.name && kindOf(f.name) !== "other") // drop metadata/thumbnail/junk files
+        .map(f => ({
+          name: f.name,
+          url: `https://archive.org/download/${identifier}/${f.name.split("/").map(encodeURIComponent).join("/")}`,
+          size: f.size ? parseInt(f.size, 10) : null,
+        }));
+      archiveCache.set(identifier, playable);
+      return playable;
+    }catch(e){
+      console.warn("Error loading Internet Archive item:", identifier, e);
+      archiveCache.set(identifier, []);
+      return [];
+    }
+  }
+
+  let archiveMapLoaded = false;
+  let archiveFilesByPath = {}; // path -> [{name, url, size}, ...]
+
+  async function loadArchiveItemsMap(){
+    if (archiveMapLoaded) return archiveFilesByPath;
+    archiveMapLoaded = true;
+    const paths = Object.keys(CONFIG.ARCHIVE_ITEMS || {});
+    for (const path of paths){
+      const identifiers = CONFIG.ARCHIVE_ITEMS[path] || [];
+      let combined = [];
+      for (const id of identifiers){
+        const files = await fetchArchiveItem(id);
+        combined = combined.concat(files);
+      }
+      archiveFilesByPath[path] = combined;
+    }
+    return archiveFilesByPath;
+  }
+
+  // immediate virtual subfolder names of `path`, derived from links.json keys and Internet Archive item paths
   function virtualChildFolders(path){
     const seen = new Set();
     const prefix = path + "/";
-    Object.keys(linksMap).forEach(key => {
+    const allKeys = [...Object.keys(linksMap), ...Object.keys(CONFIG.ARCHIVE_ITEMS || {})];
+    allKeys.forEach(key => {
       if (key === path) return;
       if (!key.startsWith(prefix)) return;
       const rest = key.slice(prefix.length);
@@ -434,7 +487,7 @@
     }));
   }
 
-  // merges real GitHub items with virtual folders + external files for a given path
+  // merges real GitHub items with virtual folders + external files + Internet Archive files for a given path
   function mergeWithExternals(path, realItems){
     const realDirNames = new Set(realItems.filter(i => i.type === "dir").map(i => i.name));
     const virtualDirs = virtualChildFolders(path).filter(v => !realDirNames.has(v.name));
@@ -447,7 +500,16 @@
       size: null,
     }));
 
-    const combined = [...realItems, ...virtualDirs, ...externalFiles];
+    const archiveFiles = (archiveFilesByPath[path] || []).map(entry => ({
+      name: entry.name,
+      type: "file",
+      external: true,
+      archive: true,
+      download_url: entry.url,
+      size: entry.size,
+    }));
+
+    const combined = [...realItems, ...virtualDirs, ...externalFiles, ...archiveFiles];
     combined.sort((a,b) => {
       if ((a.type === "dir") !== (b.type === "dir")) return a.type === "dir" ? -1 : 1;
       return a.name.localeCompare(b.name);
@@ -551,6 +613,7 @@
     try{
       const realItems = await apiGetSafe(path);
       await loadLinksMap();
+      await loadArchiveItemsMap();
       const items = mergeWithExternals(path, realItems);
 
       fileListEl.innerHTML = "";
@@ -563,7 +626,7 @@
         row.className = "file-row" + (item.type === "dir" ? " folder" : "");
         const k = item.type === "file" ? kindOf(item.name) : null;
         const riskyTag = k === "video-risky" ? `<span class="tag">check codec</span>` : "";
-        const externalTag = item.external ? `<span class="tag external">external</span>` : "";
+        const externalTag = item.archive ? `<span class="tag external">archive.org</span>` : (item.external ? `<span class="tag external">external</span>` : "");
         row.innerHTML = `
           ${iconFor(item.type, item.name)}
           <span class="name">${item.name}</span>
@@ -642,6 +705,7 @@
   // ---------- boot ----------
   (async function init(){
     await loadLinksMap();
+    await loadArchiveItemsMap();
     await buildTreeItem(CONFIG.ROOT, 0, treeRoot);
     const rootRow = treeRoot.querySelector(`.tree-item[data-path="${CSS.escape(CONFIG.ROOT)}"]`);
     if (rootRow) rootRow.click();
